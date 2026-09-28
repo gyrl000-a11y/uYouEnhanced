@@ -38,7 +38,7 @@ on:
         type: string
       upload_artifact:
         description: "Upload IPA as artifact"
-        default: false
+        default: true
         required: false
         type: boolean
       create_release:
@@ -152,11 +152,26 @@ jobs:
       - name: Prepare YouTube iPA
         id: prepare_youtube
         run: |
+          set -euo pipefail
           wget "$YOUTUBE_URL" --quiet -O main/YouTube.ipa
           cd main
-          mv YouTube.ipa YouTube.zip
-          unzip -q YouTube.zip
+          file_type=$(file --mime-type -b YouTube.ipa)
+          if [[ "$file_type" != "application/x-ios-app" && "$file_type" != "application/zip" ]]; then
+            echo "::error::The downloaded file is not a valid IPA (detected: $file_type). Check decrypted_youtube_url is a direct download link."
+            exit 1
+          fi
+          unzip -q YouTube.ipa
+          rm -f YouTube.ipa
+          if [ ! -f Payload/YouTube.app/Info.plist ]; then
+            echo "::error::Payload/YouTube.app not found inside the IPA."
+            exit 1
+          fi
+          if otool -l Payload/YouTube.app/YouTube | grep -q "cryptid 1"; then
+            echo "::error::The YouTube IPA is still encrypted (cryptid 1). A decrypted IPA is required."
+            exit 1
+          fi
           youtube_version=$(defaults read "$(pwd)/Payload/YouTube.app/Info" CFBundleVersion)
+          echo "==> YouTube v$youtube_version downloaded"
           echo "YT_VERSION=$youtube_version" >> $GITHUB_ENV
           echo "youtube_version=${youtube_version}" >> $GITHUB_OUTPUT
 
@@ -166,16 +181,25 @@ jobs:
       - name: Fix compiling & Build Package
         id: build_package
         run: |
+          set -eo pipefail
           cd main
-          sed -i '' "s/^BUNDLE_ID .*/BUNDLE_ID = ${{ inputs.bundle_id }}/" Makefile || echo "BUNDLE_ID = ${{ inputs.bundle_id }}" >> Makefile
-          sed -i '' "s/^DISPLAY_NAME .*/DISPLAY_NAME = ${{ inputs.app_name }}/" Makefile || echo "DISPLAY_NAME = ${{ inputs.app_name }}" >> Makefile
-          sed -i '' "s/^export TARGET .*/export TARGET = iphone:clang:${{ inputs.sdk_version }}:16.0/" Makefile || echo "export TARGET = iphone:clang:${{ inputs.sdk_version }}:16.0" >> Makefile
-          make package THEOS_PACKAGE_SCHEME=rootless IPA=Payload/YouTube.app FINALPACKAGE=1 YTUHD_ENABLED=${{ inputs.ytuhd && '1' || '0' }} SPONSORBLOCK_ENABLED=${{ inputs.sponsorblock && '1' || '0' }}
-          echo "package=$(ls -t packages | head -n1)" >> $GITHUB_OUTPUT
+          make package THEOS_PACKAGE_SCHEME=rootless IPA=Payload/YouTube.app FINALPACKAGE=1 \
+            SDK_VERSION="$SDK_VERSION" YOUTUBE_VERSION="$YT_VERSION" \
+            BUNDLE_ID="$BUNDLE_ID" DISPLAY_NAME="$APP_NAME" \
+            YTUHD_ENABLED=${{ inputs.ytuhd && '1' || '0' }} SPONSORBLOCK_ENABLED=${{ inputs.sponsorblock && '1' || '0' }}
+          package=$(ls -t packages | grep '\.ipa$' | head -n1 || true)
+          if [ -z "$package" ]; then
+            echo "::error::make package did not produce an IPA."
+            exit 1
+          fi
+          echo "package=$package" >> $GITHUB_OUTPUT
 
         env:
           THEOS: ${{ github.workspace }}/theos
+          SDK_VERSION: ${{ inputs.sdk_version }}
           UYOU_VERSION: ${{ inputs.uyou_version }}
+          BUNDLE_ID: ${{ inputs.bundle_id }}
+          APP_NAME: ${{ inputs.app_name }}
 
       - name: Clone Open in YouTube (Safari Extension)
         run: |
@@ -279,19 +303,23 @@ jobs:
       - name: Inject Tweaks Into IPA
         run: |
           IPA_IN="main/packages/${{ steps.build_package.outputs.package }}"
-          OUTNAME="uYouEnhanced_${{ env.YT_VERSION }}_v${{ inputs.uyou_version }}.ipa"
+          OUTNAME="uYouEnhanced_${YT_VERSION}_v${UYOU_VERSION}.ipa"
           tweaks="OpenYouTubeSafariExtension.appex"
           for f in main/packages/*.deb; do
             [ -f "$f" ] && tweaks="$tweaks $f"
           done
-          cyan -i "$IPA_IN" -o "$OUTNAME" -uwef $tweaks -n "${{ inputs.app_name }}" -b ${{ inputs.bundle_id }}
+          cyan -i "$IPA_IN" -o "$OUTNAME" -uwef $tweaks -n "$APP_NAME" -b "$BUNDLE_ID"
+        env:
+          UYOU_VERSION: ${{ inputs.uyou_version }}
+          BUNDLE_ID: ${{ inputs.bundle_id }}
+          APP_NAME: ${{ inputs.app_name }}
 
       - name: Strip Unresignable Extensions From Final IPA
         id: strip_ipa
         run: |
           set -euo pipefail
 
-          OUTNAME="uYouEnhanced_${{ env.YT_VERSION }}_v${{ inputs.uyou_version }}.ipa"
+          OUTNAME="uYouEnhanced_${YT_VERSION}_v${{ inputs.uyou_version }}.ipa"
           if [ ! -f "$OUTNAME" ]; then
             OUTNAME="$(basename "$(find . -maxdepth 3 -name 'uYouEnhanced_*.ipa' -print -quit)")"
           fi
@@ -364,11 +392,8 @@ jobs:
       - name: Upload Artifact
         if: ${{ inputs.upload_artifact }}
         uses: actions/upload-artifact@v7
-        env:
-          UYOU_VERSION: ${{ inputs.uyou_version }}
-          YOUTUBE_VERSION: ${{ steps.prepare_youtube.outputs.youtube_version }}
         with:
-          name: uYouEnhanced_${{ env.YOUTUBE_VERSION }}_${{ env.UYOU_VERSION }}
+          name: uYouEnhanced_${{ steps.prepare_youtube.outputs.youtube_version }}_${{ inputs.uyou_version }}
           path: ${{ github.workspace }}/main/packages/${{ env.RENAMED_IPA || steps.strip_ipa.outputs.final_ipa }}
           if-no-files-found: error
 
